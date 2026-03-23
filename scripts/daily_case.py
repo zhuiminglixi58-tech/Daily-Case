@@ -5,7 +5,7 @@
 Kimi API 要点：
 - 兼容 OpenAI SDK，base_url = https://api.moonshot.cn/v1
 - 联网搜索使用内置 builtin_function.$web_search（需多轮 tool_call 循环）
-- 使用 $web_search 时必须关闭 thinking（enable_thinking=False）
+- 使用 $web_search 时必须关闭 thinking
 - 推荐模型：kimi-k2.5
 """
 
@@ -16,15 +16,15 @@ from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-MOONSHOT_API_KEY  = os.environ["MOONSHOT_API_KEY"]
+MOONSHOT_API_KEY = os.environ["MOONSHOT_API_KEY"]
 FEISHU_WEBHOOK_URL = os.environ["FEISHU_WEBHOOK_URL"]
 MODEL = "kimi-k2.5"
 
 # 北京时间
 BJT = timezone(timedelta(hours=8))
-now_bjt    = datetime.now(BJT)
-today_str  = now_bjt.strftime("%Y年%m月%d日")
-weekday_cn = ["周一","周二","周三","周四","周五","周六","周日"][now_bjt.weekday()]
+now_bjt = datetime.now(BJT)
+today_str = now_bjt.strftime("%Y年%m月%d日")
+weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_bjt.weekday()]
 
 # Kimi 客户端（OpenAI 兼容）
 client = OpenAI(
@@ -41,64 +41,13 @@ WEB_SEARCH_TOOL = [
 ]
 
 
-# ── 核心：带 $web_search 多轮循环的 chat ──────────────────────────────────────
-def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
-    """
-    Kimi $web_search 的标准调用循环：
-    1. 发送请求，附带 builtin_function.$web_search
-    2. 若模型返回 tool_calls，执行 search_impl（原样返回 arguments），
-       将结果追加到 messages，继续循环
-    3. 直到模型返回普通 text 内容，退出循环并返回文本
-    """
-    messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user},
-    ]
-
-    for round_num in range(10):  # 最多 10 轮 tool_call
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            tools=WEB_SEARCH_TOOL,
-            # 使用 $web_search 时必须关闭 thinking
-            extra_body={"enable_thinking": False},
-        )
-
-        choice = response.choices[0]
-
-        # 模型决定不再调用工具 → 直接返回文本
-        if choice.finish_reason == "stop":
-            return choice.message.content or ""
-
-        # 模型请求调用 tool_calls
-        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            # 关键：把 assistant 整个 message 原样追加回 messages（含 reasoning_content 等字段）
-            messages.append(choice.message)
-
-            # 执行每个 tool_call：$web_search 只需原样返回 arguments
-            for tc in choice.message.tool_calls:
-                arguments = json.loads(tc.function.arguments)
-                # Kimi 官方说明：search_impl 原样返回 arguments 即可
-                search_result = arguments
-
-                messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "name":         tc.function.name,
-                    "content":      json.dumps(search_result, ensure_ascii=False),
-                })
-        else:
-            # 其他 finish_reason（如 length），直接取内容
-            return choice.message.content or ""
-
-    # 超出最大轮次，返回最后一次内容
-    return choice.message.content or ""
-
-
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
 def extract_json_text(text: str) -> str:
     """从模型输出中尽量提取最外层 JSON 文本。"""
-    text = text.strip()
+    text = (text or "").strip()
+
+    if not text:
+        return ""
 
     if text.startswith("```"):
         parts = text.split("```")
@@ -113,6 +62,69 @@ def extract_json_text(text: str) -> str:
         return text[start:end + 1].strip()
 
     return text
+
+
+# ── 核心：带 $web_search 多轮循环的 chat ──────────────────────────────────────
+def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user},
+    ]
+
+    last_content = ""
+
+    for _ in range(10):
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            tools=WEB_SEARCH_TOOL,
+            extra_body={
+                "thinking": {"type": "disabled"}
+            },
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+        last_content = message.content or ""
+
+        if choice.finish_reason == "stop":
+            return last_content
+
+        if choice.finish_reason == "tool_calls" and message.tool_calls:
+            assistant_msg = {
+                "role": "assistant",
+                "content": message.content or "",
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": tc.type or "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in message.tool_calls
+                ],
+            }
+            messages.append(assistant_msg)
+
+            for tc in message.tool_calls:
+                try:
+                    arguments = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {"raw_arguments": tc.function.arguments or ""}
+
+                # Moonshot 官方文档：$web_search 这里直接原样返回 arguments
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(arguments, ensure_ascii=False),
+                })
+        else:
+            return last_content
+
+    return last_content
 
 
 # ── Step 1: 筛选5个候选案例 ───────────────────────────────────────────────────
@@ -160,7 +172,11 @@ def fetch_five_cases() -> list[dict]:
     if not clean:
         raise RuntimeError("Kimi 返回了空内容，无法解析 cases JSON")
 
-    data = json.loads(clean)
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Kimi 返回内容不是合法 JSON: {clean}") from e
+
     if "cases" not in data:
         raise RuntimeError(f"Kimi 返回内容里没有 cases 字段: {clean}")
 
@@ -230,7 +246,11 @@ def analyze_top_case(cases: list[dict]) -> dict:
     if not clean:
         raise RuntimeError("Kimi 返回了空内容，无法解析 analysis JSON")
 
-    analysis = json.loads(clean)
+    try:
+        analysis = json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Kimi 返回的 analysis 不是合法 JSON: {clean}") from e
+
     print(f"  ✓ 选中第 {analysis['selected_rank']} 个案例，完成深度分析")
     return analysis
 
@@ -253,7 +273,7 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
     cases_md = []
     for i, c in enumerate(cases):
         star = "⭐ " if (i + 1) == analysis["selected_rank"] else ""
-        em   = cat_emoji.get(c["category"], "⚪")
+        em = cat_emoji.get(c["category"], "⚪")
         cases_md.append(
             f"{star}{em} **{i+1}. {c['title']}**\n"
             f"   {c['source']} · {c['company']} · {c['date']}\n"
@@ -374,9 +394,9 @@ def main():
     print(f"  每日财经案例精选（Kimi K2.5）· {today_str} {weekday_cn}")
     print(f"{'='*52}\n")
 
-    cases    = fetch_five_cases()
+    cases = fetch_five_cases()
     analysis = analyze_top_case(cases)
-    card     = build_feishu_card(cases, analysis)
+    card = build_feishu_card(cases, analysis)
     send_to_feishu(card)
 
     print("\n✅ 全部完成！")
