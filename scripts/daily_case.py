@@ -5,7 +5,7 @@
 Kimi API 要点：
 - 兼容 OpenAI SDK，base_url = https://api.moonshot.cn/v1
 - 联网搜索使用内置 builtin_function.$web_search（需多轮 tool_call 循环）
-- 使用 $web_search 时必须关闭 thinking（enable_thinking=False）
+- 使用 $web_search 时必须关闭 thinking
 - 推荐模型：kimi-k2.5
 """
 
@@ -16,15 +16,15 @@ from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-MOONSHOT_API_KEY  = os.environ["MOONSHOT_API_KEY"]
+MOONSHOT_API_KEY = os.environ["MOONSHOT_API_KEY"]
 FEISHU_WEBHOOK_URL = os.environ["FEISHU_WEBHOOK_URL"]
 MODEL = "kimi-k2.5"
 
 # 北京时间
 BJT = timezone(timedelta(hours=8))
-now_bjt    = datetime.now(BJT)
-today_str  = now_bjt.strftime("%Y年%m月%d日")
-weekday_cn = ["周一","周二","周三","周四","周五","周六","周日"][now_bjt.weekday()]
+now_bjt = datetime.now(BJT)
+today_str = now_bjt.strftime("%Y年%m月%d日")
+weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_bjt.weekday()]
 
 # Kimi 客户端（OpenAI 兼容）
 client = OpenAI(
@@ -39,6 +39,29 @@ WEB_SEARCH_TOOL = [
         "function": {"name": "$web_search"},
     }
 ]
+
+
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+def extract_json_text(text: str) -> str:
+    """从模型输出中尽量提取最外层 JSON 文本。"""
+    text = (text or "").strip()
+
+    if not text:
+        return ""
+
+    if text.startswith("```"):
+        parts = text.split("```")
+        if len(parts) >= 3:
+            text = parts[1].lstrip("json").strip()
+        else:
+            text = text.strip("`").lstrip("json").strip()
+
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start:end + 1].strip()
+
+    return text
 
 
 # ── 核心：带 $web_search 多轮循环的 chat ──────────────────────────────────────
@@ -87,7 +110,10 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
             messages.append(assistant_msg)
 
             for tc in message.tool_calls:
-                arguments = json.loads(tc.function.arguments or "{}")
+                try:
+                    arguments = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {"raw_arguments": tc.function.arguments or ""}
 
                 # Moonshot 官方文档：$web_search 这里直接原样返回 arguments
                 messages.append({
@@ -95,12 +121,12 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
                     "tool_call_id": tc.id,
                     "content": json.dumps(arguments, ensure_ascii=False),
                 })
-
         else:
             return last_content
 
     return last_content
-    
+
+
 # ── Step 1: 筛选5个候选案例 ───────────────────────────────────────────────────
 def fetch_five_cases() -> list[dict]:
     print("▶ Step 1: Kimi 联网搜索，筛选5个案例...")
@@ -136,14 +162,25 @@ def fetch_five_cases() -> list[dict]:
     user = f"请联网搜索凤凰财经、新浪财经、腾讯财经近7天的企业深度报道，筛选5篇有记者初步判断但缺乏深入论证的文章，按JSON返回。今天是{today_str}。"
 
     raw = chat_with_search(system, user, max_tokens=4000)
+    clean = extract_json_text(raw)
 
-    # 容错解析：去掉可能的 markdown 代码块
-    clean = raw.strip()
-    if clean.startswith("```"):
-        clean = clean.split("```")[-2] if "```" in clean[3:] else clean
-        clean = clean.lstrip("json").strip().rstrip("`").strip()
+    print("RAW RESPONSE:")
+    print(raw)
+    print("CLEAN RESPONSE:")
+    print(clean)
 
-    cases = json.loads(clean)["cases"]
+    if not clean:
+        raise RuntimeError("Kimi 返回了空内容，无法解析 cases JSON")
+
+    try:
+        data = json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Kimi 返回内容不是合法 JSON: {clean}") from e
+
+    if "cases" not in data:
+        raise RuntimeError(f"Kimi 返回内容里没有 cases 字段: {clean}")
+
+    cases = data["cases"]
     print(f"  ✓ 获取到 {len(cases)} 个案例")
     return cases
 
@@ -199,14 +236,21 @@ def analyze_top_case(cases: list[dict]) -> dict:
     user = f"今天的5个候选案例：\n\n{cases_summary}\n\n请选出最值得深度写作的1个，进行完整商学院式分析，返回JSON。"
 
     raw = analyze_with_search(system, user)
+    clean = extract_json_text(raw)
 
-    clean = raw.strip()
-    if clean.startswith("```"):
-        clean = clean.split("```")[1].lstrip("json").strip()
-        if clean.endswith("```"):
-            clean = clean[:-3].strip()
+    print("ANALYSIS RAW RESPONSE:")
+    print(raw)
+    print("ANALYSIS CLEAN RESPONSE:")
+    print(clean)
 
-    analysis = json.loads(clean)
+    if not clean:
+        raise RuntimeError("Kimi 返回了空内容，无法解析 analysis JSON")
+
+    try:
+        analysis = json.loads(clean)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Kimi 返回的 analysis 不是合法 JSON: {clean}") from e
+
     print(f"  ✓ 选中第 {analysis['selected_rank']} 个案例，完成深度分析")
     return analysis
 
@@ -229,7 +273,7 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
     cases_md = []
     for i, c in enumerate(cases):
         star = "⭐ " if (i + 1) == analysis["selected_rank"] else ""
-        em   = cat_emoji.get(c["category"], "⚪")
+        em = cat_emoji.get(c["category"], "⚪")
         cases_md.append(
             f"{star}{em} **{i+1}. {c['title']}**\n"
             f"   {c['source']} · {c['company']} · {c['date']}\n"
@@ -350,9 +394,9 @@ def main():
     print(f"  每日财经案例精选（Kimi K2.5）· {today_str} {weekday_cn}")
     print(f"{'='*52}\n")
 
-    cases    = fetch_five_cases()
+    cases = fetch_five_cases()
     analysis = analyze_top_case(cases)
-    card     = build_feishu_card(cases, analysis)
+    card = build_feishu_card(cases, analysis)
     send_to_feishu(card)
 
     print("\n✅ 全部完成！")
