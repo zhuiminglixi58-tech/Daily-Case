@@ -74,7 +74,7 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
         # 模型请求调用 tool_calls
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
             # 将 assistant 的 tool_calls 消息追加到历史
-            messages.append({
+            assistant_msg = {
                 "role": "assistant",
                 "content": choice.message.content or "",
                 "tool_calls": [
@@ -88,7 +88,13 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
                     }
                     for tc in choice.message.tool_calls
                 ]
-            })
+            }
+
+            # 把 reasoning_content 原样带回去（Kimi 多轮 tool_call 必须）
+            if hasattr(choice.message, "reasoning_content") and choice.message.reasoning_content:
+                assistant_msg["reasoning_content"] = choice.message.reasoning_content
+
+            messages.append(assistant_msg)
 
             # 执行每个 tool_call：$web_search 只需原样返回 arguments
             for tc in choice.message.tool_calls:
