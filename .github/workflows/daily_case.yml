@@ -1,0 +1,32 @@
+name: 每日财经案例精选（Kimi）
+
+on:
+  # 每天北京时间 08:00 触发（UTC 00:00）
+  schedule:
+    - cron: '0 0 * * 1-5'    # 周一至周五
+  # 支持手动触发（测试用）
+  workflow_dispatch:
+
+jobs:
+  run-daily-case:
+    name: Kimi 联网搜索 & 飞书推送
+    runs-on: ubuntu-latest
+    timeout-minutes: 20       # Kimi 多轮 tool_call 留足时间
+
+    steps:
+      - name: Checkout 代码
+        uses: actions/checkout@v4
+
+      - name: 配置 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安装依赖
+        run: pip install openai requests
+
+      - name: 运行每日案例脚本
+        env:
+          MOONSHOT_API_KEY:  ${{ secrets.MOONSHOT_API_KEY }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: python scripts/daily_case.py
