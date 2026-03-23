@@ -43,21 +43,14 @@ WEB_SEARCH_TOOL = [
 
 # ── 核心：带 $web_search 多轮循环的 chat ──────────────────────────────────────
 def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
-    """
-    Kimi $web_search 标准调用循环。
-    关键：assistant 消息必须用 HTTP 原始字典回填，
-    确保 reasoning_content 字段（即使为空字符串）始终存在，
-    否则第二轮请求会报 400 错误。
-    """
     messages = [
         {"role": "system", "content": system},
-        {"role": "user",   "content": user},
+        {"role": "user", "content": user},
     ]
 
     last_content = ""
 
     for _ in range(10):
-        # 注意：使用 $web_search 时必须关闭 thinking
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
@@ -67,55 +60,53 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
         )
 
         choice = response.choices[0]
-        msg    = choice.message
-        last_content = msg.content or ""
+        message = choice.message
+        last_content = message.content or ""
 
-        # 正常结束 → 返回文本
         if choice.finish_reason == "stop":
             return last_content
 
-        # 模型要调用工具
-        if choice.finish_reason == "tool_calls" and msg.tool_calls:
-
-            # ★ 核心修复：手动构造 assistant 字典，强制带上 reasoning_content
-            # model_dump() 可能丢失该字段，直接用 getattr 安全取值
+        if choice.finish_reason == "tool_calls" and message.tool_calls:
             assistant_msg = {
                 "role": "assistant",
-                "content": msg.content or "",
-                "reasoning_content": getattr(msg, "reasoning_content", "") or "",
+                "content": message.content or "",
                 "tool_calls": [
                     {
-                        "id":   tc.id,
-                        "type": "function",
+                        "id": tc.id,
+                        "type": tc.type or "function",
                         "function": {
-                            "name":      tc.function.name,
+                            "name": tc.function.name,
                             "arguments": tc.function.arguments,
                         },
                     }
-                    for tc in msg.tool_calls
+                    for tc in message.tool_calls
                 ],
+                # 关键：无论有没有，都显式带上
+                "reasoning_content": getattr(message, "reasoning_content", "") or "",
             }
+
+            print("DEBUG assistant_msg =", json.dumps(assistant_msg, ensure_ascii=False))
+
             messages.append(assistant_msg)
 
-            # 每个 tool_call：$web_search 原样返回 arguments 即可
-            for tc in msg.tool_calls:
+            for tc in message.tool_calls:
                 try:
                     arguments = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
-                    arguments = {}
+                    arguments = {"raw_arguments": tc.function.arguments}
 
                 messages.append({
-                    "role":         "tool",
+                    "role": "tool",
                     "tool_call_id": tc.id,
-                    "name":         tc.function.name,
-                    "content":      json.dumps(arguments, ensure_ascii=False),
+                    "name": tc.function.name,
+                    "content": json.dumps(arguments, ensure_ascii=False),
                 })
 
+            print("DEBUG messages =", json.dumps(messages, ensure_ascii=False))
         else:
             return last_content
 
     return last_content
-
 
 # ── Step 1: 筛选5个候选案例 ───────────────────────────────────────────────────
 def fetch_five_cases() -> list[dict]:
