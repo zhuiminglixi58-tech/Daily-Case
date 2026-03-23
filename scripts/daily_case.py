@@ -16,15 +16,15 @@ from datetime import datetime, timezone, timedelta
 from openai import OpenAI
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-MOONSHOT_API_KEY  = os.environ["MOONSHOT_API_KEY"]
+MOONSHOT_API_KEY = os.environ["MOONSHOT_API_KEY"]
 FEISHU_WEBHOOK_URL = os.environ["FEISHU_WEBHOOK_URL"]
 MODEL = "kimi-k2.5"
 
 # 北京时间
 BJT = timezone(timedelta(hours=8))
-now_bjt    = datetime.now(BJT)
-today_str  = now_bjt.strftime("%Y年%m月%d日")
-weekday_cn = ["周一","周二","周三","周四","周五","周六","周日"][now_bjt.weekday()]
+now_bjt = datetime.now(BJT)
+today_str = now_bjt.strftime("%Y年%m月%d日")
+weekday_cn = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][now_bjt.weekday()]
 
 # Kimi 客户端（OpenAI 兼容）
 client = OpenAI(
@@ -32,7 +32,7 @@ client = OpenAI(
     base_url="https://api.moonshot.cn/v1",
 )
 
-# $web_search 内置工具声明（不需要参数描述）
+# $web_search 内置工具声明
 WEB_SEARCH_TOOL = [
     {
         "type": "builtin_function",
@@ -46,54 +46,83 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
     """
     Kimi $web_search 的标准调用循环：
     1. 发送请求，附带 builtin_function.$web_search
-    2. 若模型返回 tool_calls，执行 search_impl（原样返回 arguments），
-       将结果追加到 messages，继续循环
-    3. 直到模型返回普通 text 内容，退出循环并返回文本
+    2. 若模型返回 tool_calls，将 assistant 消息原样追加到 messages
+    3. 对每个 $web_search tool_call，将 arguments 原样作为 tool 结果返回
+    4. 直到模型返回普通文本
     """
     messages = [
         {"role": "system", "content": system},
-        {"role": "user",   "content": user},
+        {"role": "user", "content": user},
     ]
 
-    for round_num in range(10):  # 最多 10 轮 tool_call
+    last_content = ""
+
+    for _ in range(10):  # 最多 10 轮 tool_call
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
             max_tokens=max_tokens,
             tools=WEB_SEARCH_TOOL,
-            # 使用 $web_search 时必须关闭 thinking
+            # 使用 $web_search 时关闭 thinking
             extra_body={"enable_thinking": False},
         )
 
         choice = response.choices[0]
+        message = choice.message
+        last_content = message.content or ""
 
         # 模型决定不再调用工具 → 直接返回文本
         if choice.finish_reason == "stop":
-            return choice.message.content or ""
+            return last_content
 
         # 模型请求调用 tool_calls
-        if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            # 关键：把 assistant 整个 message 原样追加回 messages（含 reasoning_content 等字段）
-            messages.append(choice.message.model_dump(exclude_none=True))
+        if choice.finish_reason == "tool_calls" and message.tool_calls:
+            # 优先完整回填 assistant message，避免丢字段
+            if hasattr(message, "model_dump"):
+                assistant_msg = message.model_dump(exclude_none=True)
+            else:
+                assistant_msg = {
+                    "role": "assistant",
+                    "content": message.content or "",
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": tc.type,
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in message.tool_calls
+                    ],
+                }
+                if getattr(message, "reasoning_content", None):
+                    assistant_msg["reasoning_content"] = message.reasoning_content
+
+            messages.append(assistant_msg)
 
             # 执行每个 tool_call：$web_search 只需原样返回 arguments
-            for tc in choice.message.tool_calls:
-                arguments = json.loads(tc.function.arguments)
-                # Kimi 官方说明：search_impl 原样返回 arguments 即可
+            for tc in message.tool_calls:
+                try:
+                    arguments = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError:
+                    arguments = {"raw_arguments": tc.function.arguments}
+
+                # Kimi 官方约定：tool 结果原样返回 arguments
                 search_result = arguments
 
                 messages.append({
-                    "role":         "tool",
+                    "role": "tool",
                     "tool_call_id": tc.id,
-                    "name":         tc.function.name,
-                    "content":      json.dumps(search_result, ensure_ascii=False),
+                    "name": tc.function.name,
+                    "content": json.dumps(search_result, ensure_ascii=False),
                 })
         else:
-            # 其他 finish_reason（如 length），直接取内容
-            return choice.message.content or ""
+            # 其他 finish_reason（如 length）
+            return last_content
 
-    # 超出最大轮次，返回最后一次内容
-    return choice.message.content or ""
+    # 超出最大轮次
+    return last_content
 
 
 # ── Step 1: 筛选5个候选案例 ───────────────────────────────────────────────────
@@ -135,8 +164,11 @@ def fetch_five_cases() -> list[dict]:
     # 容错解析：去掉可能的 markdown 代码块
     clean = raw.strip()
     if clean.startswith("```"):
-        clean = clean.split("```")[-2] if "```" in clean[3:] else clean
-        clean = clean.lstrip("json").strip().rstrip("`").strip()
+        parts = clean.split("```")
+        if len(parts) >= 3:
+            clean = parts[1].lstrip("json").strip()
+        else:
+            clean = clean.strip("`").lstrip("json").strip()
 
     cases = json.loads(clean)["cases"]
     print(f"  ✓ 获取到 {len(cases)} 个案例")
@@ -197,9 +229,11 @@ def analyze_top_case(cases: list[dict]) -> dict:
 
     clean = raw.strip()
     if clean.startswith("```"):
-        clean = clean.split("```")[1].lstrip("json").strip()
-        if clean.endswith("```"):
-            clean = clean[:-3].strip()
+        parts = clean.split("```")
+        if len(parts) >= 3:
+            clean = parts[1].lstrip("json").strip()
+        else:
+            clean = clean.strip("`").lstrip("json").strip()
 
     analysis = json.loads(clean)
     print(f"  ✓ 选中第 {analysis['selected_rank']} 个案例，完成深度分析")
@@ -216,15 +250,18 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
     top = cases[analysis["selected_rank"] - 1]
 
     cat_emoji = {
-        "商业模式": "🔵", "危机管理": "🔴",
-        "创新颠覆": "🟢", "战略转型": "🟠", "组织管理": "🟣"
+        "商业模式": "🔵",
+        "危机管理": "🔴",
+        "创新颠覆": "🟢",
+        "战略转型": "🟠",
+        "组织管理": "🟣",
     }
 
     # 5个案例速览
     cases_md = []
     for i, c in enumerate(cases):
         star = "⭐ " if (i + 1) == analysis["selected_rank"] else ""
-        em   = cat_emoji.get(c["category"], "⚪")
+        em = cat_emoji.get(c["category"], "⚪")
         cases_md.append(
             f"{star}{em} **{i+1}. {c['title']}**\n"
             f"   {c['source']} · {c['company']} · {c['date']}\n"
@@ -232,25 +269,21 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
             f"   写作空白：{c['writing_gap'][:50]}…"
         )
 
-    # 矛盾块
     contradictions_md = "\n\n".join(
         f"**{ct['title']}**\n记者提出：{ct['journalist_said']}\n论证空白：{ct['gap']}"
         for ct in analysis["contradictions"]
     )
 
-    # 框架块
     frameworks_md = "\n\n".join(
         f"**{fw['name']}**（{fw['angle']}）\n{fw['key_questions']}"
         for fw in analysis["frameworks"]
     )
 
-    # 写作提纲
     outline_md = "\n".join(
         f"{j+1}. **{ch['chapter']}**\n   {ch['thesis']}"
         for j, ch in enumerate(analysis["outline"])
     )
 
-    # 管理启示
     insights_md = "\n".join(f"• {ins}" for ins in analysis["insights"])
 
     return {
@@ -261,19 +294,19 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
             "header": {
                 "title": {
                     "tag": "plain_text",
-                    "content": f"📰 每日财经案例精选 · {today_str}"
+                    "content": f"📰 每日财经案例精选 · {today_str}",
                 },
                 "subtitle": {
                     "tag": "plain_text",
-                    "content": f"来源：凤凰财经 · 新浪财经 · 腾讯财经 | {weekday_cn} · 案例写作选题库"
+                    "content": f"来源：凤凰财经 · 新浪财经 · 腾讯财经 | {weekday_cn} · 案例写作选题库",
                 },
-                "template": "blue"
+                "template": "blue",
             },
             "body": {
                 "elements": [
                     {
                         "tag": "markdown",
-                        "content": "## 今日5个候选案例\n\n" + "\n\n".join(cases_md)
+                        "content": "## 今日5个候选案例\n\n" + "\n\n".join(cases_md),
                     },
                     {"tag": "hr"},
                     {
@@ -282,49 +315,49 @@ def build_feishu_card(cases: list[dict], analysis: dict) -> dict:
                             f"## ⭐ 今日重点深度分析\n\n"
                             f"**{top['title']}**\n"
                             f"{top['source']} · {top['company']} · {top['industry']} · {top['date']}"
-                        )
+                        ),
                     },
                     {
                         "tag": "markdown",
-                        "content": f"**推荐理由**\n{analysis['reason']}"
+                        "content": f"**推荐理由**\n{analysis['reason']}",
                     },
                     {
                         "tag": "markdown",
-                        "content": f"**核心研究问题**\n> {analysis['research_question']}"
-                    },
-                    {"tag": "hr"},
-                    {
-                        "tag": "markdown",
-                        "content": f"### 一、事件背景与关键数据\n\n{analysis['background']}"
+                        "content": f"**核心研究问题**\n> {analysis['research_question']}",
                     },
                     {"tag": "hr"},
                     {
                         "tag": "markdown",
-                        "content": f"### 二、核心矛盾界定\n\n{contradictions_md}"
+                        "content": f"### 一、事件背景与关键数据\n\n{analysis['background']}",
                     },
                     {"tag": "hr"},
                     {
                         "tag": "markdown",
-                        "content": f"### 三、推荐分析框架\n\n{frameworks_md}"
+                        "content": f"### 二、核心矛盾界定\n\n{contradictions_md}",
                     },
                     {"tag": "hr"},
                     {
                         "tag": "markdown",
-                        "content": f"### 四、写作提纲\n\n{outline_md}"
+                        "content": f"### 三、推荐分析框架\n\n{frameworks_md}",
                     },
                     {"tag": "hr"},
                     {
                         "tag": "markdown",
-                        "content": f"### 五、管理启示\n\n{insights_md}"
+                        "content": f"### 四、写作提纲\n\n{outline_md}",
                     },
                     {"tag": "hr"},
                     {
                         "tag": "markdown",
-                        "content": f"🔗 [查看原文]({top.get('url', '#')})"
-                    }
+                        "content": f"### 五、管理启示\n\n{insights_md}",
+                    },
+                    {"tag": "hr"},
+                    {
+                        "tag": "markdown",
+                        "content": f"🔗 [查看原文]({top.get('url', '#')})",
+                    },
                 ]
-            }
-        }
+            },
+        },
     }
 
 
@@ -345,9 +378,9 @@ def main():
     print(f"  每日财经案例精选（Kimi K2.5）· {today_str} {weekday_cn}")
     print(f"{'='*52}\n")
 
-    cases    = fetch_five_cases()
+    cases = fetch_five_cases()
     analysis = analyze_top_case(cases)
-    card     = build_feishu_card(cases, analysis)
+    card = build_feishu_card(cases, analysis)
     send_to_feishu(card)
 
     print("\n✅ 全部完成！")
