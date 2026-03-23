@@ -43,13 +43,6 @@ WEB_SEARCH_TOOL = [
 
 # ── 核心：带 $web_search 多轮循环的 chat ──────────────────────────────────────
 def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
-    """
-    Kimi $web_search 的标准调用循环：
-    1. 发送请求，附带 builtin_function.$web_search
-    2. 若模型返回 tool_calls，将 assistant 消息原样追加到 messages
-    3. 对每个 $web_search tool_call，将 arguments 原样作为 tool 结果返回
-    4. 直到模型返回普通文本
-    """
     messages = [
         {"role": "system", "content": system},
         {"role": "user", "content": user},
@@ -57,13 +50,12 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
 
     last_content = ""
 
-    for _ in range(10):  # 最多 10 轮 tool_call
+    for _ in range(10):
         response = client.chat.completions.create(
             model=MODEL,
             messages=messages,
             max_tokens=max_tokens,
             tools=WEB_SEARCH_TOOL,
-            # 使用 $web_search 时关闭 thinking
             extra_body={"enable_thinking": False},
         )
 
@@ -71,15 +63,13 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
         message = choice.message
         last_content = message.content or ""
 
-        # 模型决定不再调用工具 → 直接返回文本
         if choice.finish_reason == "stop":
             return last_content
 
-        # 模型请求调用 tool_calls
         if choice.finish_reason == "tool_calls" and message.tool_calls:
-            # 优先完整回填 assistant message，避免丢字段
+            # 关键：完整回填 assistant message
             if hasattr(message, "model_dump"):
-                assistant_msg = message.model_dump(exclude_none=True)
+                assistant_msg = message.model_dump(exclude_none=False)
             else:
                 assistant_msg = {
                     "role": "assistant",
@@ -95,33 +85,30 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
                         }
                         for tc in message.tool_calls
                     ],
+                    "reasoning_content": getattr(message, "reasoning_content", ""),
                 }
-                if getattr(message, "reasoning_content", None):
-                    assistant_msg["reasoning_content"] = message.reasoning_content
+
+            # 再兜底一次：没有就补空字符串
+            if "reasoning_content" not in assistant_msg or assistant_msg["reasoning_content"] is None:
+                assistant_msg["reasoning_content"] = ""
 
             messages.append(assistant_msg)
 
-            # 执行每个 tool_call：$web_search 只需原样返回 arguments
             for tc in message.tool_calls:
                 try:
                     arguments = json.loads(tc.function.arguments or "{}")
                 except json.JSONDecodeError:
                     arguments = {"raw_arguments": tc.function.arguments}
 
-                # Kimi 官方约定：tool 结果原样返回 arguments
-                search_result = arguments
-
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "name": tc.function.name,
-                    "content": json.dumps(search_result, ensure_ascii=False),
+                    "content": json.dumps(arguments, ensure_ascii=False),
                 })
         else:
-            # 其他 finish_reason（如 length）
             return last_content
 
-    # 超出最大轮次
     return last_content
 
 
