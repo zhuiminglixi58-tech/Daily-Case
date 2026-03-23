@@ -73,22 +73,8 @@ def chat_with_search(system: str, user: str, max_tokens: int = 6000) -> str:
 
         # 模型请求调用 tool_calls
         if choice.finish_reason == "tool_calls" and choice.message.tool_calls:
-            # 将 assistant 的 tool_calls 消息追加到历史
-            messages.append({
-                "role": "assistant",
-                "content": choice.message.content or "",
-                "tool_calls": [
-                    {
-                        "id":       tc.id,
-                        "type":     "function",
-                        "function": {
-                            "name":      tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                    }
-                    for tc in choice.message.tool_calls
-                ]
-            })
+            # 关键：把 assistant 整个 message 原样追加回 messages（含 reasoning_content 等字段）
+            messages.append(choice.message.model_dump(exclude_none=True))
 
             # 执行每个 tool_call：$web_search 只需原样返回 arguments
             for tc in choice.message.tool_calls:
